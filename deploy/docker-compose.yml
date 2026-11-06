@@ -1,0 +1,16 @@
+services:
+  uv-mirror:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: uv-mirror:latest
+    container_name: uv-mirror
+    restart: unless-stopped
+    ports:
+      # 公開ポート（環境変数 UV_MIRROR_PORT または .env で変更可能。未指定時は 80）
+      - "${UV_MIRROR_PORT:-80}:80"
+    volumes:
+      # ホスト側の mirror_data 格納ディレクトリをコンテナ内の /var/www/uv-mirror にマウント
+      # 未指定時は ../mirror_data がマウントされます。
+      # ホストの固定ディレクトリ（例: /var/www/uv-mirror）を使う場合は .env または環境変数 UV_DATA_DIR で指定してください。
+      - "${UV_DATA_DIR:-../mirror_data}:/var/www/uv-mirror:ro"

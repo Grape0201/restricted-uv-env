@@ -1,0 +1,75 @@
+# ==============================================================================
+# 制限環境向け uv ミラー収集設定ファイル (config.toml)
+# ==============================================================================
+
+[mirror]
+# Box 同期フォルダ内の出力先パス（相対パスまたは絶対パス）
+# 例: "C:/Users/<User>/Box/uv-offline-mirror/mirror_data"
+output_dir = "./mirror_data"
+
+# 同時ダウンロード数
+max_workers = 4
+
+[network]
+# Zscaler 等の社内 SSL インスペクション環境対応:
+# true にすると Windows の OS 証明書ストア（Zscaler ルート証明書等）を uv と Python の両方で自動利用します
+use_system_certs = true
+
+# 個別の PEM 証明書ファイル（Zscaler Root CA 等）を明示指定したい場合はパスを記入（空欄なら OS ストアを使用）
+# 例: "C:/certs/ZscalerRootCA.pem"
+ca_bundle = ""
+
+# プロキシ設定（空欄の場合は環境変数 HTTP_PROXY / HTTPS_PROXY または Windows のシステムプロキシ設定を自動検出）
+# 例: "http://proxy.example.co.jp:8080"
+https_proxy = ""
+http_proxy = ""
+no_proxy = "localhost,127.0.0.1"
+
+# 万が一 SSL 証明書検証エラーが解消できない場合の最終手段（通常は false のままにしてください）
+verify_ssl = true
+
+[uv]
+# 取得する uv のバージョン:
+# - "latest" : GitHub Releases から最新版の uv (Windows用・Linux用) を自動取得し、
+#              その最新版の uv を使って Python ランタイムと Wheel を解決します（おすすめ）
+# - "local"  : 現在 PC にインストールされている uv と同じバージョンを取得します
+# - "0.10.0" : 特定のバージョン番号を固定で取得します
+target_version = "latest"
+
+# 取得する uv 本体のターゲット一覧
+targets = [
+    "x86_64-pc-windows-msvc",
+    "x86_64-unknown-linux-gnu",
+]
+
+[python]
+# 制限環境で使いたい Python (CPython) のマイナーバージョン一覧
+versions = ["3.11", "3.12", "3.13"]
+
+# 取得する Python ランタイム (python-build-standalone) の対象 OS・アーキテクチャ
+platforms = [
+    { os = "windows", arch = "x86_64", libc = "none" },
+    { os = "linux",   arch = "x86_64", libc = "gnu" },
+]
+
+[packages]
+# 制限環境内の Windows / Linux で使いたいパッケージ一覧
+# バージョン指定（例: "numpy>=2.0", "fastapi==0.115.*"）も可能です。
+# ここに書いて sync_to_box.py を実行するだけで、Windows 用・Linux 用両方の全依存 Wheel を自動収集します。
+include = [
+    "pip",
+    "setuptools",
+    "wheel",
+    "ruff",
+    "pytest",
+    "requests",
+    "httpx",
+    "pydantic",
+    "numpy",
+    "pandas",
+]
+
+# プロジェクトの requirements.txt や pyproject.toml から依存パッケージをまとめて収集したい場合は
+# ファイルパスをリストに追加してください（複数指定可）
+# 例: ["C:/work/my-project/pyproject.toml", "C:/work/another/requirements.txt"]
+requirement_files = []
