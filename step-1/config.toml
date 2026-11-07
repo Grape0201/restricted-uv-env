@@ -4,8 +4,9 @@
 
 [mirror]
 # Box 同期フォルダ内の出力先パス（相対パスまたは絶対パス）
-# 例: "C:/Users/<User>/Box/uv-offline-mirror/mirror_data"
-output_dir = "./mirror_data"
+# デフォルトはプロジェクト直下の mirror_data フォルダに出力されます。
+# 例: "C:/Users/<User>/Box/restricted-uv-env/mirror_data"
+output_dir = "../mirror_data"
 
 # 同時ダウンロード数
 max_workers = 4

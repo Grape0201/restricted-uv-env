@@ -1,30 +1,35 @@
-# Ubuntu Linux サーバー構築・専用アカウント運用ガイド (Docker Compose + rsync)
+# Ubuntu Linux サーバー構築・専用アカウント運用ガイド (Docker Compose + xcopy / rsync)
 
-制限環境内の Ubuntu サーバーに **Docker Compose** で Nginx 配信サーバーを常駐させ、**転送専用アカウント（`uvsync`）** を作成してセキュアに運用するための手順書です。
+制限環境内の Ubuntu サーバーに **Docker Compose** で Nginx 配信サーバーを常駐させ、**Windows から xcopy (SMB共有)** または **Linux から rsync (SSH)** で資材を受信してセキュアに運用するための手順書です。
 
 ---
 
 ## 運用アーキテクチャ
 
 ```text
-[ クライアント (Windows / Linux) ]
-         │
-         │ rsync (SSH 鍵認証)
-         ▼
-[ Ubuntu ホストサーバー ]
-   受信ユーザー : uvsync (sudo権限なし・docker権限なしの最小権限)
-   配置先      : /var/www/uv-mirror
-         │
-         │ バインドマウント (:ro 読み取り専用)
-         ▼
-[ Nginx コンテナ (Docker Compose) ] ── (HTTP :80) ──> [ 社内クライアント (uv) ]
+[ Windows クライアント ]              [ Linux / WSL クライアント ]
+         │                                       │
+         │ xcopy (SMB 共有 / UNC パス)            │ rsync (SSH 鍵認証)
+         ▼                                       ▼
+┌─────────────────────────────────────────────────────────────┐
+│ Ubuntu ホストサーバー                                       │
+│    受信用ユーザー : uvsync (最小権限)                       │
+│    受信用パス     : /var/www/uv-mirror                      │
+│                    │                                        │
+│                    │ バインドマウント (:ro 読み取り専用)    │
+│                    ▼                                        │
+│    Nginx コンテナ (Docker Compose, HTTP :80)                │
+└────────────────────┬────────────────────────────────────────┘
+                     │ HTTP 配信 (Flat 方式)
+                     ▼
+             [ 社内各端末 (uv) ]
 ```
 
 * **安全な最小権限設計**:
   * `uvsync` アカウントには `sudo`（管理者）権限も `docker` 実行権限も**一切与えません**。
   * ファイルをホスト上のディレクトリに配置することだけに専念させます。
 * **メンテナンスフリー**:
-  * ホスト側のディレクトリがコンテナに読み取り専用（`:ro`）で直接マウントされるため、**rsync で差分ファイルが送られてきた瞬間に即座に Web 配信へ反映**されます。日々の同期でコンテナを再起動する必要はありません。
+  * ホスト側のディレクトリがコンテナに読み取り専用（`:ro`）で直接マウントされるため、**Windows から xcopy （または Linux から rsync）で差分ファイルが送られてきた瞬間に即座に Web 配信へ反映**されます。日々の同期でコンテナを再起動する必要はありません。
 
 ---
 
@@ -50,12 +55,51 @@ sudo chmod 755 /var/www/uv-mirror
 
 ---
 
-### Step 2: SSH 鍵認証の設定（パスワードレス rsync 用）
+### Step 2-A: Windows からの xcopy 受信用 Samba (SMB) 共有設定（Windows PC から転送する場合）
 
-クライアント端末（Windows / Linux）からパスワード入力なしで転送できるよう、公開鍵を `uvsync` に登録します。
+Windows PC から標準の `xcopy` コマンドで Linux サーバーへ転送できるようにするため、`/var/www/uv-mirror` を Samba で共有します。
+
+```bash
+# 1. Samba をインストール
+sudo apt update && sudo apt install -y samba
+
+# 2. uvsync の Samba パスワードを設定（Windows から接続する際の認証パスワード）
+sudo smbpasswd -a uvsync
+
+# 3. /etc/samba/smb.conf の末尾に共有設定を追記
+sudo tee -a /etc/samba/smb.conf << 'EOF'
+
+[uv-mirror]
+   comment = UV Offline Mirror Storage
+   path = /var/www/uv-mirror
+   browseable = yes
+   read only = no
+   guest ok = no
+   valid users = uvsync
+   create mask = 0644
+   directory mask = 0755
+   force user = uvsync
+   force group = uvsync
+EOF
+
+# 4. Samba サービスを再起動して設定を反映
+sudo systemctl restart smbd
+
+# 5. （UFW 等のファイアウォール有効時のみ）Samba ポートを許可
+sudo ufw allow samba
+```
+
+> **Windows 側からの接続確認**:
+> Windows PC のエクスプローラーのアドレスバーに `\\<LINUX_SERVER_IP>\uv-mirror` を入力し、ユーザー名 `uvsync` と設定したパスワードでサインインできることを確認してください。
+
+---
+
+### Step 2-B: Linux / WSL からの rsync 用 SSH 鍵認証設定（Linux PC から転送する場合）
+
+Linux または WSL 端末からパスワード入力なしで転送できるよう、公開鍵を `uvsync` に登録します。
 
 #### 1. クライアント側で SSH 鍵を生成（未生成の場合のみ）
-クライアント端末（Windows の PowerShell や Git Bash 等）で実行します：
+クライアント端末（PowerShell や Git Bash 等）で実行します：
 ```bash
 ssh-keygen -t ed25519 -C "uv-mirror-sync"
 # 全て Enter（パスフレーズなし、または任意で設定）
@@ -80,11 +124,11 @@ sudo chmod 600 /home/uvsync/.ssh/authorized_keys
 
 ### Step 3: Docker Compose で Nginx 配信コンテナを起動
 
-本リポジトリの `deploy/` ディレクトリを使用してコンテナを起動します。
+本リポジトリの `step-2/` ディレクトリを使用してコンテナを起動します。
 
 ```bash
-# deploy ディレクトリに移動
-cd /path/to/restricted-uv-env/deploy
+# step-2 ディレクトリに移動
+cd /path/to/restricted-uv-env/step-2
 
 # 環境変数設定ファイルを作成
 cp .env.example .env
@@ -113,18 +157,24 @@ docker compose up -d
 
 ## 日常の同期テスト
 
-クライアント端末から専用アカウント `uvsync` を指定して転送します。
+クライアント端末から Linux サーバーへ資材を転送します。
 
-* **Git Bash / WSL / Linux 端末から**:
-  ```bash
-  ./deploy/rsync_to_server.sh ./mirror_data uvsync@<LINUX_SERVER_IP>:/var/www/uv-mirror
+* **Windows 端末から (xcopy / 推奨)**:
+  `step-3` フォルダ内のバッチファイルをダブルクリック（またはコマンドプロンプトで実行）：
+  ```cmd
+  .\step-3\copy_to_server.bat "\\<LINUX_SERVER_IP>\uv-mirror"
   ```
-* **Windows (PowerShell) から**:
+  PowerShell から実行する場合:
   ```powershell
-  .\deploy\rsync_to_server.ps1 -RemoteTarget "uvsync@<LINUX_SERVER_IP>:/var/www/uv-mirror"
+  powershell -ExecutionPolicy Bypass -File .\step-3\copy_to_server.ps1 -Destination "\\<LINUX_SERVER_IP>\uv-mirror"
   ```
+  ※ Windows 標準の `xcopy` コマンドが差分ファイルのみを自動抽出してコピーします。追加ツール（`rsync.exe` 等）は不要です。
 
-※ スクリプト内で `--chmod=Du=rwx,Dg=rx,Do=rx,Fu=rw,Fg=r,Fo=r` が自動付与されるため、ファイルは `0644`、ディレクトリは `0755` で配置され、コンテナ内の Nginx から即座に読み取り可能になります。
+* **Linux / WSL / Git Bash 端末から (rsync)**:
+  ```bash
+  ./step-3/rsync_to_server.sh ./mirror_data uvsync@<LINUX_SERVER_IP>:/var/www/uv-mirror
+  ```
+  ※ スクリプト内で `--chmod=Du=rwx,Dg=rx,Do=rx,Fu=rw,Fg=r,Fo=r` が自動付与されるため、ファイルは `0644`、ディレクトリは `0755` で配置され、コンテナ内の Nginx から即座に読み取り可能になります。
 
 #### 動作確認
 ブラウザまたは `curl` でアクセスします：
@@ -191,7 +241,7 @@ command="/usr/bin/rrsync -wo /var/www/uv-mirror",no-pty,no-agent-forwarding,no-p
 > [!WARNING]
 > `rrsync` を指定した場合、クライアント側の転送コマンドの宛先パスは `/var/www/uv-mirror` ではなく**相対パス（`.`）**を指定してください：
 > ```bash
-> ./deploy/rsync_to_server.sh ./mirror_data uvsync@<LINUX_SERVER_IP>:.
+> ./step-3/rsync_to_server.sh ./mirror_data uvsync@<LINUX_SERVER_IP>:.
 > ```
 
 ---
