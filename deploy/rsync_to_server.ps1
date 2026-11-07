@@ -7,7 +7,7 @@ Windows 上にインストールされた rsync.exe (Git for Windows / cwRsync /
 または WSL 内の rsync を自動検出し、Windows パスを自動変換して転送します。
 
 .PARAMETER RemoteTarget
-転送先の SSH ターゲットとパス (例: "user@192.168.1.10:/var/www/uv-mirror")
+転送先の SSH ターゲットとパス (例: "uvsync@192.168.1.10:/var/www/uv-mirror")
 
 .PARAMETER SourceDir
 Box 内の mirror_data パス (デフォルト: スクリプトの親フォルダにある mirror_data)
@@ -29,7 +29,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 if ([string]::IsNullOrWhiteSpace($RemoteTarget)) {
-    Write-Host "[入力] 転送先の Linux サーバーを指定してください (例: user@192.168.1.10:/var/www/uv-mirror)" -ForegroundColor Yellow
+    Write-Host "[入力] 転送先の Linux サーバーを指定してください (例: uvsync@192.168.1.10:/var/www/uv-mirror)" -ForegroundColor Yellow
     $RemoteTarget = Read-Host "RemoteTarget"
 }
 

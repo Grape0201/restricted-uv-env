@@ -11,11 +11,11 @@ DEFAULT_SOURCE="${SCRIPT_DIR}/../mirror_data"
 
 # 環境変数または引数で上書き可能
 SOURCE_DIR="${1:-${UV_MIRROR_SOURCE:-$DEFAULT_SOURCE}}"
-REMOTE_TARGET="${2:-${UV_MIRROR_REMOTE:-user@linux-web-server:/var/www/uv-mirror}}"
+REMOTE_TARGET="${2:-${UV_MIRROR_REMOTE:-uvsync@linux-web-server:/var/www/uv-mirror}}"
 
 if [[ ! -d "$SOURCE_DIR" ]]; then
     echo "[ERROR] 同期元ディレクトリが見つかりません: $SOURCE_DIR" >&2
-    echo "使い方: $0 [同期元フォルダパス] [user@host:/var/www/uv-mirror]" >&2
+    echo "使い方: $0 [同期元フォルダパス] [uvsync@host:/var/www/uv-mirror]" >&2
     exit 1
 fi
 

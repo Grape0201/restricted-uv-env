@@ -31,6 +31,7 @@ restricted-uv-env/
 │   ├── docker-compose.yml      # [内部Linuxサーバー用] docker compose up -d で起動する Compose 定義
 │   ├── .env.example            # [内部Linuxサーバー用] ポートやデータディレクトリの設定例
 │   ├── nginx-uv-mirror.conf    # [内部Linuxサーバー用] Nginx 設定ファイル (autoindex on)
+│   ├── ubuntu_server_setup.md  # [内部Linuxサーバー用] Ubuntu 向け専用アカウント・権限・SSH設定手順書
 │   ├── rsync_to_server.sh      # [内部Win(Git Bash/WSL)/Linux用] BoxからLinuxサーバーへの rsync 差分転送
 │   ├── rsync_to_server.ps1     # [内部Win(PowerShell)用] BoxからLinuxサーバーへの rsync 差分転送
 │   ├── setup_client_linux.sh   # [内部Linux端末用] uv 導入・uv.toml 設定・uv-offline-update 作成
@@ -71,37 +72,37 @@ restricted-uv-env/
 
 ### Step 2: 制限環境内の Linux Web サーバーを設定する（初回のみ）
 
-Linux サーバー上での Nginx 構築は、**Docker Compose を使う方法（推奨）** と **ホストに直接インストールする方法** のどちらでも利用可能です。
+ホスト環境を汚さず、安全かつ簡単に運用するため **Docker Compose** で Nginx 配信サーバーを起動します。
 
-#### 方法 A: Docker Compose を使う場合（推奨）
-ホスト環境を汚さずに `autoindex on;` を含んだミラー配信コンテナを即座に起動できます。
+> [!TIP]
+> 本番運用で推奨される **専用アカウント（`uvsync`）の作成（sudoなし・docker権限なしの最小権限）** や SSH 鍵設定、IP制限、`rrsync` 隔離の詳細手順は、**[`deploy/ubuntu_server_setup.md`](file:///Users/shotaro/work/restricted-uv-env/deploy/ubuntu_server_setup.md)** を参照してください。
 
-1. `deploy/` ディレクトリに移動します：
-   ```bash
-   cd deploy
-   ```
-2. （任意）ポート番号（デフォルト 80）やデータマウント元（デフォルト `../mirror_data`）を変更したい場合は `.env` を作成します：
-   ```bash
-   cp .env.example .env
-   # 必要に応じて vi .env で編集 (例: UV_DATA_DIR=/var/www/uv-mirror)
-   ```
-3. コンテナを起動します：
-   ```bash
-   docker compose up -d
-   ```
-   ※ オフライン環境でビルド用イメージ（`nginx:alpine`）がない場合は、インターネット側 PC であらかじめ `docker pull nginx:alpine && docker save nginx:alpine -o nginx-alpine.tar` して Box 経由で持ち込み、`docker load -i nginx-alpine.tar` しておくと安心です。
+#### クイックスタート手順
 
-#### 方法 B: ホストに直接 Nginx をインストールする場合
-1. Linux Web サーバー上で公開用ディレクトリを作成します：
+1. **配信用ディレクトリの準備**:
+   サーバー上で受信用ディレクトリを作成します：
    ```bash
    sudo mkdir -p /var/www/uv-mirror
    sudo chown -R $USER:$USER /var/www/uv-mirror
+   sudo chmod 755 /var/www/uv-mirror
    ```
-2. [`deploy/nginx-uv-mirror.conf`](file:///Users/shotaro/work/restricted-uv-env/deploy/nginx-uv-mirror.conf) を `/etc/nginx/conf.d/uv-mirror.conf`（Ubuntu 等の場合は `/etc/nginx/sites-enabled/uv-mirror`）に配置し、Nginx をリロードします：
+
+2. **設定ファイル（`.env`）の準備**:
+   `deploy/` ディレクトリに移動し、`.env` を作成してマウント先を指定します：
    ```bash
-   sudo cp deploy/nginx-uv-mirror.conf /etc/nginx/conf.d/uv-mirror.conf
-   sudo nginx -t && sudo systemctl reload nginx
+   cd deploy
+   cp .env.example .env
+   # vi .env 等で UV_DATA_DIR=/var/www/uv-mirror に設定
    ```
+
+3. **コンテナの起動**:
+   ```bash
+   docker compose up -d
+   ```
+   * `restart: unless-stopped` が設定されているため、サーバー再起動時も自動的に立ち上がります。
+   * ホスト側のディレクトリがコンテナに読み取り専用（`:ro`）でマウントされるため、**日々のファイル同期のたびにコンテナを再起動する必要はありません**。
+
+   ※ オフライン環境でビルド用イメージ（`nginx:alpine`）がない場合は、インターネット側 PC であらかじめ `docker pull nginx:alpine && docker save nginx:alpine -o nginx-alpine.tar` して Box 経由で持ち込み、`docker load -i nginx-alpine.tar` しておくと安心です。
 
 ---
 
@@ -111,13 +112,13 @@ Box の同期が完了したら、制限環境内の Windows PC から `rsync` �
 
 * **Git Bash / WSL から実行する場合**:
   ```bash
-  ./deploy/rsync_to_server.sh ./mirror_data user@<LINUX_SERVER_IP>:/var/www/uv-mirror
+  ./deploy/rsync_to_server.sh ./mirror_data uvsync@<LINUX_SERVER_IP>:/var/www/uv-mirror
   ```
 * **PowerShell から実行する場合**:
   ```powershell
-  .\deploy\rsync_to_server.ps1 -RemoteTarget "user@<LINUX_SERVER_IP>:/var/www/uv-mirror"
+  .\deploy\rsync_to_server.ps1 -RemoteTarget "uvsync@<LINUX_SERVER_IP>:/var/www/uv-mirror"
   ```
-  ※ `--chmod=Du=rwx,Dg=rx,Do=rx,Fu=rw,Fg=r,Fo=r` が自動付与されるため、Windows からの転送でも Nginx で権限エラー（403 Forbidden）になりません。
+  ※ `--chmod=Du=rwx,Dg=rx,Do=rx,Fu=rw,Fg=r,Fo=r` が自動付与されるため、Windows からの転送でもコンテナ側で権限エラー（403 Forbidden）になりません。
 
 ---
 
