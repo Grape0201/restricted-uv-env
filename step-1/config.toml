@@ -74,3 +74,14 @@ include = [
 # ファイルパスをリストに追加してください（複数指定可）
 # 例: ["C:/work/my-project/pyproject.toml", "C:/work/another/requirements.txt"]
 requirement_files = []
+
+[audit]
+# 解決済みパッケージを OSV (https://osv.dev) に照会して既知の脆弱性を報告します (pip-audit 相当)
+# 結果は mirror_data/audit_report.json にも保存されます
+enabled = true
+
+# true にすると脆弱性が見つかった場合、Wheel をダウンロードせずに中断します
+fail_on_vulnerability = false
+
+# 無視する脆弱性 ID (GHSA-xxxx / CVE-xxxx / PYSEC-xxxx)
+ignore_ids = []

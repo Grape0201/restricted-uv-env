@@ -154,6 +154,16 @@ class NetworkClient:
         with self.opener.open(req, timeout=30) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
+    def post_json(self, url: str, payload: Any) -> Any:
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"User-Agent": "uv-offline-sync/1.0", "Content-Type": "application/json"},
+            method="POST",
+        )
+        with self.opener.open(req, timeout=60) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
     def download_file(
         self,
         url: str,
@@ -497,6 +507,87 @@ def build_uv_environment_markers(platforms: list[dict[str, str]]) -> list[str]:
     return markers
 
 
+def audit_packages(
+    cfg: dict[str, Any],
+    net: NetworkClient,
+    packages: list[dict[str, Any]],
+    output_dir: Path,
+) -> None:
+    """uv.lock の解決結果を OSV (osv.dev) に照会し、既知の脆弱性を報告する (pip-audit 相当)"""
+    audit_cfg = cfg.get("audit", {})
+    if not audit_cfg.get("enabled", True):
+        return
+    ignore_ids = {str(i) for i in audit_cfg.get("ignore_ids", [])}
+    fail_on_vuln = bool(audit_cfg.get("fail_on_vulnerability", False))
+
+    targets = [
+        (p["name"], p["version"])
+        for p in packages
+        if p.get("name") != "offline-wheel-collector" and p.get("version")
+        and "registry" in p.get("source", {})
+    ]
+    print(f"\n[Audit] 脆弱性チェック (OSV): {len(targets)} パッケージ")
+    queries = [
+        {"package": {"name": n, "ecosystem": "PyPI"}, "version": v} for n, v in targets
+    ]
+    try:
+        ids_per_pkg: list[list[str]] = []
+        for i in range(0, len(queries), 500):
+            res = net.post_json(
+                "https://api.osv.dev/v1/querybatch", {"queries": queries[i : i + 500]}
+            )
+            ids_per_pkg += [[v["id"] for v in r.get("vulns", [])] for r in res["results"]]
+
+        findings: list[dict[str, Any]] = []
+        for (name, ver), ids in zip(targets, ids_per_pkg):
+            for vid in ids:
+                detail = net.get_json(f"https://api.osv.dev/v1/vulns/{vid}")
+                aliases = {vid, *detail.get("aliases", [])}
+                if aliases & ignore_ids:
+                    continue
+                fixed = sorted(
+                    {
+                        e["fixed"]
+                        for a in detail.get("affected", [])
+                        if a.get("package", {}).get("name", "").lower().replace("_", "-") == name
+                        for r in a.get("ranges", [])
+                        for e in r.get("events", [])
+                        if "fixed" in e
+                    }
+                )
+                findings.append(
+                    {
+                        "package": name,
+                        "version": ver,
+                        "id": vid,
+                        "aliases": sorted(aliases - {vid}),
+                        "fixed_in": fixed,
+                        "summary": detail.get("summary", ""),
+                    }
+                )
+    except (urllib.error.URLError, OSError, KeyError, ValueError) as e:
+        msg = f"  [警告] 脆弱性チェックに失敗しました: {e}"
+        if fail_on_vuln:
+            sys.exit(msg)
+        print(msg)
+        return
+
+    (output_dir / "audit_report.json").write_text(
+        json.dumps(findings, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    if not findings:
+        print("  -> 既知の脆弱性は見つかりませんでした")
+        return
+    for f in findings:
+        fix = ", ".join(f["fixed_in"]) or "修正版なし"
+        print(f"  [脆弱性] {f['package']}=={f['version']}  {f['id']}  (修正版: {fix})")
+        if f["summary"]:
+            print(f"      {f['summary']}")
+    print(f"  -> {len(findings)} 件検出 (詳細: {output_dir / 'audit_report.json'})")
+    if fail_on_vuln:
+        sys.exit("エラー: 脆弱性が検出されたため中断します ([audit] fail_on_vulnerability = true)")
+
+
 def sync_wheels(
     cfg: dict[str, Any],
     net: NetworkClient,
@@ -578,6 +669,7 @@ environments = [
         lock_data = tomllib.loads((tmp_path / "uv.lock").read_text(encoding="utf-8"))
 
     packages = lock_data.get("package", [])
+    audit_packages(cfg, net, packages, output_dir)
     download_tasks: dict[str, tuple[str, Path, str | None]] = {}
 
     for pkg in packages:

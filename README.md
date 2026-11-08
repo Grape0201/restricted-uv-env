@@ -18,6 +18,8 @@
    * 制限環境の Windows PC に `rsync.exe` がインストールされていなくても、OS 標準搭載の `xcopy` コマンドだけで Linux サーバーへの差分転送が完了します。
 6. **制限環境内での `uv` 最新版アップデート対応**
    * 収集時に最新版の `uv` 本体を自動取得し、制限環境内の各端末では `uv-offline-update` コマンド一発で内部サーバー上の最新 `uv` へアップデートできます。
+7. **収集時の脆弱性チェック (`pip-audit` 相当)**
+   * 解決した全パッケージを [OSV](https://osv.dev) に照会し、既知の脆弱性と修正版を報告します（結果は `mirror_data/audit_report.json` にも保存）。
 
 ---
 
@@ -88,6 +90,12 @@ flowchart TD
      * プロキシが自動検出されない場合は `https_proxy = "http://proxy.example.com:8080"` を記入してください。
    * **パッケージ追加 (`[packages]`)**:
      * `include` リストに欲しいパッケージ名、または `requirement_files` にプロジェクトの `pyproject.toml` / `requirements.txt` のパスを指定します。
+   * **脆弱性チェック (`[audit]`)**:
+     * デフォルト（`enabled = true`）で、Wheel 取得前に解決済みパッケージを OSV に照会し、脆弱性を報告します（`pip-audit` 相当）。
+     * `fail_on_vulnerability = true` にすると、脆弱性検出時に Wheel を取得せず中断します。
+     * 誤検知や許容する脆弱性は `ignore_ids = ["GHSA-xxxx", "CVE-xxxx"]` で除外できます。
+     * OSV に接続できない場合は警告のみで続行します（`fail_on_vulnerability = true` の場合は中断）。
+     * 対象は収集した Python パッケージのみで、`uv` 本体や Python ランタイムは対象外です。
 3. [`step-1/run_sync.bat`](step-1/run_sync.bat) をダブルクリック（またはターミナルで `cd step-1 && uv run --system-certs sync_to_box.py -c config.toml`）します。
 4. プロジェクト直下の `mirror_data/` フォルダ内に以下の構成でファイルが差分ダウンロードされ、Box 経由で制限環境側へ自動同期されます。
    ```text
@@ -99,8 +107,9 @@ flowchart TD
    │       └── uv-x86_64-unknown-linux-gnu.tar.gz
    ├── python/
    │   └── <ビルドタグ>/cpython-3.12.x+...tar.gz
-   └── wheels/
-       └── *.whl (Windows用・Linux用・共通Wheel)
+   ├── wheels/
+   │   └── *.whl (Windows用・Linux用・共通Wheel)
+   └── audit_report.json (脆弱性チェック結果)
    ```
 
 ---
