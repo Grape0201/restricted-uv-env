@@ -396,30 +396,97 @@ def sync_python_runtimes(
 # ==============================================================================
 # Step 3: Windows / Linux 両用 Wheel の解決・一括ダウンロード
 # ==============================================================================
-def parse_requirements_from_files(files: list[str]) -> list[str]:
+def parse_requirements_from_file(p: Path) -> list[str]:
     reqs: list[str] = []
-    for file_str in files:
+    if p.name == "pyproject.toml":
+        data = tomllib.loads(p.read_text(encoding="utf-8"))
+        deps = data.get("project", {}).get("dependencies", [])
+        reqs.extend(deps)
+        opt_deps = data.get("project", {}).get("optional-dependencies", {})
+        for group_deps in opt_deps.values():
+            reqs.extend(group_deps)
+        dependency_groups = data.get("dependency-groups", {})
+        for group_deps in dependency_groups.values():
+            reqs.extend(d for d in group_deps if isinstance(d, str))
+    else:
+        # requirements.txt 形式
+        for line in p.read_text(encoding="utf-8").splitlines():
+            line = line.split("#", 1)[0].strip()
+            if line and not line.startswith("-"):
+                reqs.append(line)
+    return reqs
+
+
+def build_resolution_units(
+    include_pkgs: list[str],
+    req_files: list[str],
+) -> tuple[list[tuple[str, list[str]]], list[tuple[str, str]]]:
+    """
+    include の各パッケージは 1 件ずつ、requirement_files はファイル単位で解決単位を構築する。
+    """
+    units: list[tuple[str, list[str]]] = []
+    errors: list[tuple[str, str]] = []
+    seen_specs: set[str] = set()
+
+    for raw_spec in include_pkgs:
+        spec = raw_spec.strip()
+        if spec and spec not in seen_specs:
+            seen_specs.add(spec)
+            units.append((spec, [spec]))
+
+    for file_str in req_files:
         p = Path(file_str).expanduser().resolve()
         if not p.is_file():
-            print(f"  [警告] 指定された要件ファイルが見つかりません: {p}")
+            errors.append((file_str, f"指定された要件ファイルが見つかりません: {p}"))
             continue
-        if p.name == "pyproject.toml":
-            data = tomllib.loads(p.read_text(encoding="utf-8"))
-            deps = data.get("project", {}).get("dependencies", [])
-            reqs.extend(deps)
-            opt_deps = data.get("project", {}).get("optional-dependencies", {})
-            for group_deps in opt_deps.values():
-                reqs.extend(group_deps)
-            dependency_groups = data.get("dependency-groups", {})
-            for group_deps in dependency_groups.values():
-                reqs.extend(d for d in group_deps if isinstance(d, str))
-        else:
-            # requirements.txt 形式
-            for line in p.read_text(encoding="utf-8").splitlines():
-                line = line.split("#", 1)[0].strip()
-                if line and not line.startswith("-"):
-                    reqs.append(line)
-    return reqs
+        reqs = parse_requirements_from_file(p)
+        if not reqs:
+            print(f"  [情報] 要件ファイルに依存指定がないためスキップします: {p}")
+            continue
+        units.append((f"file:{p.name}", reqs))
+
+    return units, errors
+
+
+def resolve_unit(
+    label: str,
+    deps: list[str],
+    requires_python: str,
+    env_markers: list[str],
+    uv_bin: str,
+    uv_env: dict[str, str],
+    use_system_certs: bool,
+) -> tuple[str, list[dict[str, Any]], str | None]:
+    """単一のパッケージまたは要件ファイルについて uv lock を実行し、解決済みパッケージ一覧を返す。"""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        deps_toml = ",\n    ".join(json.dumps(r) for r in deps)
+        envs_toml = ",\n    ".join(json.dumps(m) for m in env_markers)
+        pyproject_text = f"""[project]
+name = "offline-wheel-collector"
+version = "0.1.0"
+requires-python = "{requires_python}"
+dependencies = [
+    {deps_toml}
+]
+
+[tool.uv]
+environments = [
+    {envs_toml}
+]
+"""
+        (tmp_path / "pyproject.toml").write_text(pyproject_text, encoding="utf-8")
+
+        cmd = [uv_bin, "lock", "--directory", str(tmp_path)]
+        if use_system_certs:
+            cmd.append("--system-certs")
+        res = subprocess.run(cmd, capture_output=True, text=True, env=uv_env)
+        if res.returncode != 0:
+            err = (res.stderr or res.stdout or f"exit code {res.returncode}").strip()
+            return label, [], err
+
+        lock_data = tomllib.loads((tmp_path / "uv.lock").read_text(encoding="utf-8"))
+        return label, lock_data.get("package", []), None
 
 
 def is_wheel_compatible(
@@ -520,12 +587,15 @@ def audit_packages(
     ignore_ids = {str(i) for i in audit_cfg.get("ignore_ids", [])}
     fail_on_vuln = bool(audit_cfg.get("fail_on_vulnerability", False))
 
-    targets = [
-        (p["name"], p["version"])
-        for p in packages
-        if p.get("name") != "offline-wheel-collector" and p.get("version")
-        and "registry" in p.get("source", {})
-    ]
+    targets = sorted(
+        {
+            (p["name"], p["version"])
+            for p in packages
+            if p.get("name") != "offline-wheel-collector"
+            and p.get("version")
+            and "registry" in p.get("source", {})
+        }
+    )
     print(f"\n[Audit] 脆弱性チェック (OSV): {len(targets)} パッケージ")
     queries = [
         {"package": {"name": n, "ecosystem": "PyPI"}, "version": v} for n, v in targets
@@ -594,15 +664,15 @@ def sync_wheels(
     output_dir: Path,
     uv_bin: str,
     max_workers: int,
-) -> None:
+) -> list[tuple[str, str]]:
     pkg_cfg = cfg.get("packages", {})
     include_pkgs: list[str] = list(pkg_cfg.get("include", []))
     req_files: list[str] = list(pkg_cfg.get("requirement_files", []))
-    all_reqs = include_pkgs + parse_requirements_from_files(req_files)
+    units, failed_units = build_resolution_units(include_pkgs, req_files)
 
-    if not all_reqs:
+    if not units and not failed_units:
         print("\n[Step 3/3] パッケージ指定がないため Wheel 同期をスキップします")
-        return
+        return []
 
     py_cfg = cfg.get("python", {})
     py_versions: list[str] = [str(v) for v in py_cfg.get("versions", ["3.11", "3.12", "3.13"])]
@@ -620,63 +690,55 @@ def sync_wheels(
     env_markers = build_uv_environment_markers(platforms)
 
     print(
-        f"\n[Step 3/3] Windows / Linux 両用 Wheel の解決と同期 "
-        f"(要求パッケージ数: {len(all_reqs)}, Python {requires_python})"
+        f"\n[Step 3/3] Windows / Linux 両用 Wheel の個別解決と同期 "
+        f"(解決単位: {len(units)}, Python {requires_python})"
     )
+
+    for label, err in failed_units:
+        print(f"  [解決失敗] {label}: {err}")
 
     wheels_dir = output_dir / "wheels"
     wheels_dir.mkdir(parents=True, exist_ok=True)
+    uv_env = net.build_uv_env()
 
-    # 一時ディレクトリで uv lock を実行し、全プラットフォーム・全バージョンの Wheel URL とハッシュを取得
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmp_path = Path(tmpdir)
-        pyproject_content = {
-            "project": {
-                "name": "offline-wheel-collector",
-                "version": "0.1.0",
-                "requires-python": requires_python,
-                "dependencies": all_reqs,
-            },
-            "tool": {
-                "uv": {
-                    "environments": env_markers,
-                }
-            },
-        }
-        # pyproject.toml を書き出し
-        deps_toml = ",\n    ".join(json.dumps(r) for r in all_reqs)
-        envs_toml = ",\n    ".join(json.dumps(m) for m in env_markers)
-        pyproject_text = f"""[project]
-name = "offline-wheel-collector"
-version = "0.1.0"
-requires-python = "{requires_python}"
-dependencies = [
-    {deps_toml}
-]
+    # パッケージ / 要件ファイルごとに個別に uv lock を実行し、全プラットフォーム・全バージョンの Wheel を収集
+    all_resolved_packages: list[dict[str, Any]] = []
+    if units:
+        lock_workers = max(1, min(max_workers, len(units)))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=lock_workers) as pool:
+            futures = [
+                pool.submit(
+                    resolve_unit,
+                    label,
+                    deps,
+                    requires_python,
+                    env_markers,
+                    uv_bin,
+                    uv_env,
+                    net.use_system_certs,
+                )
+                for label, deps in units
+            ]
+            for fut in concurrent.futures.as_completed(futures):
+                label, unit_packages, err = fut.result()
+                if err:
+                    failed_units.append((label, err))
+                    print(f"  [解決失敗] {label}")
+                    for line in err.splitlines():
+                        print(f"      {line}")
+                    continue
+                real_pkgs = [
+                    p for p in unit_packages if p.get("name") != "offline-wheel-collector"
+                ]
+                print(f"  [解決 OK] {label} ({len(real_pkgs)} パッケージ)")
+                all_resolved_packages.extend(real_pkgs)
 
-[tool.uv]
-environments = [
-    {envs_toml}
-]
-"""
-        (tmp_path / "pyproject.toml").write_text(pyproject_text, encoding="utf-8")
+    if all_resolved_packages:
+        audit_packages(cfg, net, all_resolved_packages, output_dir)
 
-        cmd = [uv_bin, "lock", "--directory", str(tmp_path)]
-        if net.use_system_certs:
-            cmd.append("--system-certs")
-        subprocess.run(cmd, check=True, env=net.build_uv_env())
-
-        lock_data = tomllib.loads((tmp_path / "uv.lock").read_text(encoding="utf-8"))
-
-    packages = lock_data.get("package", [])
-    audit_packages(cfg, net, packages, output_dir)
     download_tasks: dict[str, tuple[str, Path, str | None]] = {}
 
-    for pkg in packages:
-        pkg_name = pkg.get("name")
-        if pkg_name == "offline-wheel-collector":
-            continue
-
+    for pkg in all_resolved_packages:
         wheels = pkg.get("wheels", [])
         matched_any_wheel = False
         for whl in wheels:
@@ -698,30 +760,38 @@ environments = [
                 sha256_hash = sdist.get("hash")
                 download_tasks[filename] = (url, wheels_dir / filename, sha256_hash)
 
-    print(f"  -> 解決完了: 合計 {len(download_tasks)} 個のパッケージファイル (Win/Linux 両対応) を確認します")
+    print(f"  -> 解決完了: 重複排除後 {len(download_tasks)} 個のパッケージファイル (Win/Linux 両対応) を確認します")
 
     downloaded_count = 0
     skipped_count = 0
 
-    def _worker(item: tuple[str, tuple[str, Path, str | None]]) -> tuple[str, bool]:
-        fname, (u, dst, h) = item
-        is_new = net.download_file(u, dst, expected_sha256=h)
-        return fname, is_new
+    if download_tasks:
+        def _worker(item: tuple[str, tuple[str, Path, str | None]]) -> tuple[str, bool]:
+            fname, (u, dst, h) = item
+            is_new = net.download_file(u, dst, expected_sha256=h)
+            return fname, is_new
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = [pool.submit(_worker, item) for item in sorted(download_tasks.items())]
-        for fut in concurrent.futures.as_completed(futures):
-            fname, is_new = fut.result()
-            if is_new:
-                downloaded_count += 1
-                print(f"  [新規取得] {fname}")
-            else:
-                skipped_count += 1
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, max_workers)) as pool:
+            futures = [pool.submit(_worker, item) for item in sorted(download_tasks.items())]
+            for fut in concurrent.futures.as_completed(futures):
+                fname, is_new = fut.result()
+                if is_new:
+                    downloaded_count += 1
+                    print(f"  [新規取得] {fname}")
+                else:
+                    skipped_count += 1
 
     print(
         f"  -> Wheel 同期完了: 新規ダウンロード {downloaded_count} 件 / "
         f"スキップ(取得済) {skipped_count} 件 (保存先: {wheels_dir})"
     )
+
+    if failed_units:
+        print(f"\n  [警告] 解決に失敗した項目 ({len(failed_units)} 件):")
+        for label, _ in failed_units:
+            print(f"    - {label}")
+
+    return failed_units
 
 
 # ==============================================================================
@@ -785,8 +855,14 @@ def main() -> None:
     if not args.skip_python:
         sync_python_runtimes(cfg, net, output_dir, active_uv_bin)
 
+    failed_units: list[tuple[str, str]] = []
     if not args.skip_wheels:
-        sync_wheels(cfg, net, output_dir, active_uv_bin, max_workers=max_workers)
+        failed_units = sync_wheels(cfg, net, output_dir, active_uv_bin, max_workers=max_workers)
+
+    if failed_units:
+        sys.exit(
+            f"\n[警告終了] {len(failed_units)} 件のパッケージ解決に失敗しました（成功分は同期済みです）。"
+        )
 
     print("\n[完了] すべての同期処理が正常に完了しました！")
 
